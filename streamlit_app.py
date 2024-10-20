@@ -1,164 +1,317 @@
-import streamlit as st
-import numpy as np
+from langchain.agents import ConversationalChatAgent, AgentExecutor
+from langchain.memory import ConversationBufferMemory
+from langchain_community.callbacks import StreamlitCallbackHandler
+from langchain_community.chat_message_histories import StreamlitChatMessageHistory
+from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_core.runnables import RunnableConfig
+from langchain_openai import ChatOpenAI
+from langchain.prompts import PromptTemplate
+from chat_agent import ChatAgent
+from cgm import CGM
 import pandas as pd
-from langchain_openai.chat_models import ChatOpenAI
+import numpy as np
 import altair as alt
 import time
-from cgm import CGM
-from chat_agent import ChatAgent
- 
-# st.title("🦜🔗 Quickstart App")
-st.title("Prime Agent")
+import vectara_client as vectara
+
+import streamlit as st
+
+st.set_page_config(page_title="Prime agent: Chat with search", page_icon="P")
+st.title("Chat with agent")
 
 openai_api_key = st.secrets["OpenAI_key"]
+
 # openai_api_key = st.sidebar.text_input("OpenAI API Key", type="password")
-llm_model_gpt_mini = "gpt-4o-mini"
 
-def generate_response(input_text):
-    model = ChatOpenAI(temperature=0.7,  model=llm_model_gpt_mini, api_key=openai_api_key)
-    st.info(model.invoke(input_text))
+msgs = StreamlitChatMessageHistory()
+memory = ConversationBufferMemory(
+    chat_memory=msgs, return_messages=True, memory_key="chat_history", output_key="output"
+)
+# if len(msgs.messages) == 0 or st.sidebar.button("Reset chat history"):
+if len(msgs.messages) == 0:
+    msgs.clear()
+    msgs.add_ai_message("Do you want to check on this selection")
+    st.session_state.steps = {}
 
-# def call_remote_client():
-#     client
 
-## --------- Draft above ----------------------##
-
-chatagent = ChatAgent(llm_api_key=openai_api_key, model_name=llm_model_gpt_mini)
-chatagent.initialize_chat()
-
-##-- i/p elements ------#
-# Create a form
-# Initialize session state for inputs if not already set
-if 'option_select' not in st.session_state:
-    st.session_state.option_select = None
-if 'number_input' not in st.session_state:
-    st.session_state.number_input = 0
-if 'checkbox_input' not in st.session_state:
-    st.session_state.checkbox_input = False
-
-# Create a form
-with st.form("form_inputs"):
-    # Create 3 columns inside the form
-    col1, col2, col3 = st.columns(3)
-
-    # Add widgets to the first column
-    with col1:
-        st.header("Column 1")
-        ip_option = st.selectbox("Select an option:", ["Option A", "Option B", "Option C"], key="option_select")
-        st.write(f"You selected initial: {st.session_state.option_select}")
-        st.write(f"You selected now: {ip_option}")
-
-    # Add widgets to the second column
-    with col2:
-        st.header("Column 2")
-        ip_number = st.number_input("Enter a number:", min_value=0, max_value=100, key="number_input")
-
-    # Add widgets to the third column
-    with col3:
-        st.header("Column 3")
-        ip_checkbox = st.checkbox("Check me!", value=False, key="checkbox_input")
-
-    # Submit button for the form
-    submit_button = st.form_submit_button("Submit", "input_button")
-
-# Handle the form submission without losing state
-if submit_button:
-    # Display the selected values
-    st.write(f"You selected: {st.session_state.option_select}")
-    st.write(f"You entered: {st.session_state.number_input}")
-    st.write(f"Checkbox is {'checked' if st.session_state.checkbox_input else 'unchecked'}")
-
+# -------- activity widget ------------------
+HYPER_GLY = 120
+NORMAL_GLY = 85
+HYPO_GLY = 70
+DANGER_GLY = 60
 
 # Initialize session state for the selected option
 if "selected_option_activity" not in st.session_state:
-    st.session_state.selected_option_activity = None
+    st.session_state.selected_option_activity = "Select an option..."
+if "formatted_activity_prompt" not in st.session_state:
+    st.session_state.formatted_activity_prompt = None
+if "formatted_activity_prompt_gl_sn2" not in st.session_state:
+    st.session_state.formatted_activity_prompt_gl_sn2 = None
+if "formatted_activity_prompt_gl_sn1" not in st.session_state:
+    st.session_state.formatted_activity_prompt_gl_sn1 = None
+if "formatted_activity_prompt_normal" not in st.session_state:
+    st.session_state.formatted_activity_prompt_normal = None
+if "glucose_chart_session" not in st.session_state:
+    cgm = CGM(start_time = pd.Timestamp.now(), num_points=1, duration_in_minutes=5)
+    st.session_state.glucose_chart_session = cgm.initiate_cgm_chart()
+if "time_session" not in st.session_state:
+    st.session_state.time_session = pd.Timestamp.now()
+# if "new_glucose_level" not in st.session_state:
+#     st.session_state.new_glucose_level = NORMAL_GLY
+if "low_glucose_level" not in st.session_state:
+    st.session_state.low_glucose_level = None
+if "cgm_user_msg" not in st.session_state:
+    st.session_state.cgm_user_msg = None
+if "cgm_user_msg1" not in st.session_state:
+    st.session_state.cgm_user_msg1 = None
+if "cgm_user_normal_msg" not in st.session_state:
+    st.session_state.cgm_user_normal_msg = None
+
+if "emergency_step" not in st.session_state:
+    st.session_state.emergency_step = 0
+if "start_time" not in st.session_state:
+    st.session_state.start_time = time.time()
+
+if "launch_cgm" not in st.session_state:
+    st.session_state.launch_cgm = None
+
+
+if "selected_option_meal" not in st.session_state:
+    st.session_state.selected_option_meal = "Select an option..."
+if "formatted_meal_prompt" not in st.session_state:
+    st.session_state.formatted_meal_prompt = None
+
 
 def update_selection():
     st.session_state.selected_option_activity = st.session_state.key_activity
-    st.write(f"Updated session state: {st.session_state.selected_option_activity}")
+
+    prompt_template = PromptTemplate(
+        input_variables=["activity"],
+        template="Do you want to check this {activity} activity impact your current glucose level?"
+    )
+    st.write(f"selected the selected_option_activity: {st.session_state.selected_option_activity}")
+    # st.write(f"selected the key_activity: {st.session_state.key_activity}")
+     # ---- activity prompt ----/
+    formatted_activity_prompt = prompt_template.format(activity=st.session_state.selected_option_activity)
+    #------------------------
+    # memory.chat_memory.add_user_message(formatted_activity_prompt)
+    memory.chat_memory.add_user_message(formatted_activity_prompt)
+    st.session_state.formatted_activity_prompt = formatted_activity_prompt
+
+
 
 @st.fragment
-def frg_option():
-    st.write("Please choose an frg option from the dropdown:")
+def frg_option(key = "key_activity"):
     selected_option = st.selectbox(
-        "Exercise:", 
-        ['Cardio', 'Weight', 'Swimming'], 
+        "Select an Exercise and chat with agent:", 
+        ['Select an option...','Cardio', 'Weight', 'Swimming'], 
         key="key_activity",
-        on_change=update_selection
-    )   
+        on_change=update_selection    
+        )   
         # Display the selected option from session state
     if st.session_state.selected_option_activity:
         st.write(f"You selected: {st.session_state.selected_option_activity}")
 
-frg_option()
 
+def update_selection_meal():
+    st.session_state.selected_option_meal = st.session_state.key_meal
 
-# Step 1: Define the fragment function
-def sidebar_fragment():
-    # Add elements to the sidebar
-    st.sidebar.write("### Sidebar Menu")
-    
-    # Create a selectbox
-    option = st.sidebar.selectbox(
-        "Choose an option:",
-        ["Option 1", "Option 2", "Option 3"],
-        key="sidebar_option"  # Unique key for the selectbox
+    prompt_template_meal = PromptTemplate(
+        input_variables=["meal", "report"],
+        template="Check {meal} with your report {report} and suggest a meal plan?"
     )
 
-    # Create a checkbox
-    checkbox_value = st.sidebar.checkbox("Check me!", key="sidebar_checkbox")
+    # ---- search management report --------
+    report_result = "Meal"
+    result = vectara.query_vectara_diabetes_plan("What it says about meal plan?")
+    responses = result.get('responseSet', [])
+    if responses:
+        for i, response in enumerate(responses[0].get('response', []), 1):
+            print(f"\n{i}. {response.get('text')}")
+            report_result = response.get('text')
+            # st.write(report_result)
+            break
+    else:
+        print("No meals results found.")
+    # ----
+     # ---- activity prompt ----/
+    formatted_meal_prompt = prompt_template_meal.format(meal=st.session_state.selected_option_meal, report=report_result)
+    #------------------------
+    # memory.chat_memory.add_user_message(formatted_activity_prompt)
+    memory.chat_memory.add_ai_message(formatted_meal_prompt)
+    st.session_state.formatted_meal_prompt = formatted_meal_prompt
 
-    # Display the selected values
-    st.sidebar.write(f"You selected: {option}")
-    st.sidebar.write(f"Checkbox is {'checked' if checkbox_value else 'unchecked'}")
+@st.fragment
+def frg_meal(key = "key_meal"):
+    selected_option = st.selectbox(
+        "Select a meal plan and chat with agent:", 
+        ['Select an option...','Rice', 'Fruits', 'Salads'], 
+        key="key_meal",
+        on_change=update_selection_meal  
+        )   
+        # Display the selected option from session state
+    if st.session_state.selected_option_meal:
+        st.write(f"You selected: {st.session_state.selected_option_meal}")
 
-# Step 2: Use the context manager for the sidebar
-with st.sidebar:  # Start the sidebar context
-    sidebar_fragment()  # Call the fragment function to write elements to the sidebar
+@st.fragment
+def frg_display_activity():
+    selected_value = st.session_state["key_activity"]
+    st.write(f"Value from the fragment (accessed outside): {selected_value}")
+
+# -----------------------activity widget ends --------------------------
 
 
-# Initialize session state for the selected option
-if "selected_option_activity" not in st.session_state:
-    st.session_state.selected_option_activity = None
+# ---------------------- CGM widget -----------------------------------
 
-def update_selection_activity():
-    st.session_state.selected_option_activity = st.session_state.key_activity_option
-    st.write(f"Updated session state: {st.session_state.selected_option_activity}")
+# def insert_cgm_message_agent(new_gl_level):
+#     st.write(f"Inside cgm message {new_gl_level}")
+#     user_message = "glucose level going below 70 at :" + str(new_gl_level)
+#     if user_message:
+#         msgs.add_ai_message(user_message)
 
-# Create a container inside the sidebar (fragment)
-with st.sidebar.container():
-    st.sidebar.write("Select an activity:")
-    st.sidebar.selectbox(
-        "Choose an option", 
-        ['Running', 'Aerobics', 'Weights'], 
-        key="key_activity_option",
-        on_change=update_selection_activity
-    )
-    if st.session_state.selected_option_activity:
-        st.write(f"You selected: {st.session_state.selected_option_activity}")
+#         prompt_template_low_gly_sn2 = PromptTemplate(
+#         input_variables=["low_gly_user_input_sn2"],
+#         template="Want other suggestions for fast acting carbohydrates for {low_gly_user_input_sn2} "
+#         )
+#         st.write(f"Say yes to agent for help...")
+#         # ---- prompt_template_low_gly_sn2 prompt ----/
+#         formatted_activity_prompt_gl_sn2 = prompt_template_low_gly_sn2.format(low_gly_user_input_sn2= user_message)
+#         #------------------------
+#         # memory.chat_memory.add_user_message(formatted_activity_prompt)
+#         memory.chat_memory.add_user_message(formatted_activity_prompt_gl_sn2)
+#         st.session_state.formatted_activity_prompt_gl_sn2 = formatted_activity_prompt_gl_sn2
 
-with st.sidebar:
-    add_radio = st.radio(
-        "Choose a shipping method",
-        ("Standard (5-15 days)", "Express (2-5 days)")
-    )
 
-# for the fragment 
-# if 'count' not in st.session_state:
-#     st.session_state.count = 0
-
-# @st.fragment(run_every="3s")
 @st.fragment()
-def frg_cgm_auto_update(glucose_chart, cg_data, cgm : CGM, duration_in_minutes : int):
+def frg_cgm_auto_update():
+
+    duration_in_minutes = 5
+    cgm = CGM(start_time = pd.Timestamp.now(), num_points=1, duration_in_minutes=duration_in_minutes)
+    cg_data = cgm.cg_data
+
+
+    # if "glucose_chart_session" in st.session_state:
+    #     glucose_chart = st.session_state.glucose_chart_session
+    # else:
+    #     glucose_chart = cgm.initiate_cgm_chart()
+    #     st.session_state.glucose_chart_session = glucose_chart
+    
+    # -- uncomment
+    glucose_chart = cgm.initiate_cgm_chart()
+
     # Simulating dynamic data updates
     placeholder = st.empty()
-    for i in range(20):  # Simulate 5 new data points coming in
-        time.sleep(2)  # Simulating a time delay (can be removed for real-time updates)
+    for i in range(200):  # Simulate 5 new data points coming in
+        time.sleep(4)  # Simulating a time delay (can be removed for real-time updates)
         
         # Generate new data point
-        new_time = pd.Timestamp.now() + pd.Timedelta(minutes=duration_in_minutes *(cgm.num_points+i))
-        new_glucose_level = np.random.normal(loc=100, scale=10)
-        
+        new_time = pd.Timestamp.now() + pd.Timedelta(minutes=duration_in_minutes * (cgm.num_points+i))
+        new_glucose_level = np.random.normal(loc=70, scale=30)
+
+
+        #------- glucose level above 70 normals ----
+
+        if new_glucose_level > 69:              
+            user_message = "glucose level at :" + str(new_glucose_level) + "mg/dL"
+            report_result = "Is this a normal range?"
+            if st.session_state.cgm_user_normal_msg is None:    
+                st.session_state.cgm_user_normal_msg  = user_message;  
+                 # -- call corpus 
+                result = vectara.query_vectara("What it says about normal glucose level?")
+                responses = result.get('responseSet', [])
+                if responses:
+                    for i, response in enumerate(responses[0].get('response', []), 1):
+                        print(f"\n{i}. {response.get('text')}")
+                        report_result = response.get('text')
+                        st.write(report_result)
+                        break
+                else:
+                    print("No results found.")
+                st.write(user_message)
+            
+
+            if user_message:
+                msgs.add_ai_message(user_message)
+                # Sample input values
+                inputs = {
+                    "report_result": report_result,
+                    "normal_gly": user_message
+                }
+                prompt_template_normal = PromptTemplate(
+                    input_variables=["report_result", "normal_gly"],
+                    # template="Your blood sugar is danegerously low. Reach out for emergency glucogen kit {low_gly_user_input_sn1}"
+                    template="Given my report: ""{report_result}"" do you want to check impact on my levels at {normal_gly} ?"
+
+                )
+                
+                # ---- prompt_template_low_gly_sn1 prompt ----/
+                formatted_activity_prompt_normal = prompt_template_normal.format(**inputs)
+                #------------------------
+                # memory.chat_memory.add_user_message(formatted_activity_prompt)
+                memory.chat_memory.add_user_message(formatted_activity_prompt_normal)
+                st.session_state.formatted_activity_prompt_normal = formatted_activity_prompt_normal
+
+
+        #------- glucose level hypo ----
+
+        if new_glucose_level <= 70:  
+            user_message = "glucose level going below 70 at :" + str(new_glucose_level) + "mg/dL"
+            if st.session_state.cgm_user_msg is None:    
+                st.session_state.cgm_user_msg = user_message;  
+                st.write(f"glucose going below 70")
+                st.write(f"Say yes to agent for help...")
+            # if st.session_state.low_glucose_level is None:
+            #     st.session_state.low_glucose_level = new_glucose_level
+            #     # Button to insert message
+            #     if st.button("Take action", key="key_btn_low_gl", on_click=insert_cgm_message_agent, args=(new_glucose_level,)):
+            #         pass
+            
+            # st.write(f"Inside cgm message {new_glucose_level}")
+            
+            if user_message:
+                msgs.add_ai_message(user_message)
+                prompt_template_low_gly_sn2 = PromptTemplate(
+                    input_variables=["low_gly_user_input_sn2"],
+                    template="Want other suggestions for fast acting carbohydrates for {low_gly_user_input_sn2} "
+                )
+                
+                # ---- prompt_template_low_gly_sn2 prompt ----/
+                formatted_activity_prompt_gl_sn2 = prompt_template_low_gly_sn2.format(low_gly_user_input_sn2 = user_message)
+                #------------------------
+                # memory.chat_memory.add_user_message(formatted_activity_prompt)
+                memory.chat_memory.add_user_message(formatted_activity_prompt_gl_sn2)
+                st.session_state.formatted_activity_prompt_gl_sn2 = formatted_activity_prompt_gl_sn2
+
+        #-------------------------------
+
+         #------- glucose level hypo scenario 2 ----
+
+        if new_glucose_level <= 55:  
+            user_message = "EMERGENCY"
+            if st.session_state.cgm_user_msg1 is None:    
+                st.session_state.cgm_user_msg1 = user_message;  
+                st.write(f"Your blood sugar is danegerously low. Reach out for emergency glucogen kit. Call 911.")
+                frg_emergency()
+            
+            if user_message:
+                msgs.add_ai_message(user_message)
+                prompt_template_low_gly_sn1 = PromptTemplate(
+                    input_variables=["low_gly_user_input_sn1"],
+                    # template="Your blood sugar is danegerously low. Reach out for emergency glucogen kit {low_gly_user_input_sn1}"
+                    template="Instructions on how to administer the glucogen during {low_gly_user_input_sn1} ?"
+
+                )
+                
+                # ---- prompt_template_low_gly_sn1 prompt ----/
+                formatted_activity_prompt_gl_sn1 = prompt_template_low_gly_sn1.format(low_gly_user_input_sn1 = user_message)
+                #------------------------
+                # memory.chat_memory.add_user_message(formatted_activity_prompt)
+                memory.chat_memory.add_user_message(formatted_activity_prompt_gl_sn1)
+                st.session_state.formatted_activity_prompt_gl_sn1 = formatted_activity_prompt_gl_sn1
+
+        #-------------------------------
+
+
         # Add the new data
         cg_data = cgm.add_new_data(cg_data, new_time, new_glucose_level)
         
@@ -175,61 +328,149 @@ def frg_cgm_auto_update(glucose_chart, cg_data, cgm : CGM, duration_in_minutes :
         with placeholder:
             st.altair_chart(glucose_chart, use_container_width=True)
 
-cgm = CGM(start_time = pd.Timestamp.now(), num_points=1, duration_in_minutes=5)
-cg_data = cgm.cg_data
-glucose_chart = cgm.initiate_cgm_chart()
-frg_cgm_auto_update(glucose_chart, cg_data, cgm, 5)
-
-_LOREM_IPSUM = """
-Lorem ipsum dolor sit amet, **consectetur adipiscing** elit, sed do eiusmod tempor
-incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis
-nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.
-"""
+# ---------------------- CGM ends -------------------------------------
+col1, col2 = st.columns(2)
 
 
-def stream_data():
-    for word in _LOREM_IPSUM.split(" "):
-        yield word + " "
-        time.sleep(0.1)
 
-    yield pd.DataFrame(
-        np.random.randn(5, 10),
-        columns=["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"],
+# -- emergency --
+@st.fragment()
+def frg_emergency(key="key_emergency"):
+    if 'emergency_step' not in st.session_state:
+        st.session_state.emergency_step = 0
+        st.session_state.start_time = time.time()
+    st.error(":rotating_light: EMERGENCY: Severe Hypoglycemia :rotating_light:")
+    steps = ["Glucagon", "Call 911", "Wait"]
+    animation_frames = [
+        "  o   ",
+        " /|\\  ",
+        " / \\  ",
+        "      ",
+    ]
+    progress = st.progress(0)
+    status = st.empty()
+    animation = st.empty()
+    while st.session_state.emergency_step < len(steps):
+        progress.progress((st.session_state.emergency_step + 1) / len(steps))
+        status.write(f"Step {st.session_state.emergency_step + 1}: {steps[st.session_state.emergency_step]}")
+        frame = animation_frames[st.session_state.emergency_step % len(animation_frames)]
+        spaces = " " * (st.session_state.emergency_step * 10)
+        animation.text(f"{spaces}{frame}")
+        time.sleep(1)  # Simulate action time
+        st.session_state.emergency_step += 1
+        if st.session_state.emergency_step == 2:  # Wait step
+            for i in range(5):  # 5 second wait
+                animation.text(f"{spaces}{'.' * (i + 1)}")
+                time.sleep(1)
+    status.success("Emergency procedure completed!")
+    animation.empty()
+    elapsed_time = time.time() - st.session_state.start_time
+    st.write(f"Total time: {elapsed_time:.1f} seconds")
+    # if st.button("Reset", key=f"{key}_reset"):
+    #     for key in ['emergency_step', 'start_time']:
+    #         if key in st.session_state:
+    #             del st.session_state[key]
+    #     st.rerun()
+
+# Usage in Streamlit app
+
+avatars = {"human": "user", "ai": "assistant"}
+for idx, msg in enumerate(msgs.messages):
+    with st.chat_message(avatars[msg.type]):
+        # Render intermediate steps if any were saved
+        for step in st.session_state.steps.get(str(idx), []):
+            if step[0].tool == "_Exception":
+                continue
+            with st.status(f"**{step[0].tool}**: {step[0].tool_input}", state="complete"):
+                st.write(step[0].log)
+                st.write(step[1])
+        st.write(msg.content)
+
+
+
+# Function to validate activity i/p
+def validate_input(user_input):
+    if user_input not in ["Yes", "Y", "Ok", "OK"]:
+        memory.chat_memory.add_user_message("Check the activity with provider")
+        return "Check with provider"
+    else:
+        # memory.chat_memory.add_user_message("Checking the user activity")
+        return None
+
+# if prompt := st.chat_input(placeholder= st.session_state.formatted_activity_prompt):
+#     # # --validate activity ----
+#     # validation_error = validate_input(prompt)
+#     # if validation_error:
+#     #     st.error(validation_error)
+#     #     st.stop()
+#     # else:
+#     #     None
+
+#     st.chat_message("user").write(st.session_state.formatted_activity_prompt)
+#     if not openai_api_key:
+#         st.info("Please add your OpenAI API key to continue.")
+#         st.stop()
+
+# #------- llm init end -----------/
+#     # llm = ChatOpenAI(model_name="gpt-4o-mini", openai_api_key=openai_api_key, streaming=True)
+
+#     chatagent = ChatAgent(llm_api_key=openai_api_key, model_name="gpt-4o-mini")
+#     chatagent.initialize_chat()
+#     llm = chatagent.get_agent()
+
+# #------- llm init end -----------/
+#     tools = [DuckDuckGoSearchRun(name="Search")]
+#     chat_agent = ConversationalChatAgent.from_llm_and_tools(llm=llm, tools=tools)
+#     executor = AgentExecutor.from_agent_and_tools(
+#         agent=chat_agent,
+#         tools=tools,
+#         memory=memory,
+#         return_intermediate_steps=True,
+#         handle_parsing_errors=False,
+#     )
+#     with st.chat_message("assistant"):
+#         st_cb = StreamlitCallbackHandler(st.container(), expand_new_thoughts=False)
+#         cfg = RunnableConfig()
+#         cfg["callbacks"] = [st_cb]
+#         response = executor.invoke(prompt, cfg)
+#         st.write(response["output"])
+#         st.session_state.steps[str(len(msgs.messages) - 1)] = response["intermediate_steps"]
+
+if prompt := st.chat_input(placeholder="Checking..."):
+    st.chat_message("user").write(prompt)
+    # st.chat_message("assistant").write(st.session_state.formatted_activity_prompt)
+    if not openai_api_key:
+        st.info("Please add your OpenAI API key to continue.")
+        st.stop()
+
+    llm = ChatOpenAI(model_name="gpt-4o-mini", openai_api_key=openai_api_key, streaming=True)
+    tools = [DuckDuckGoSearchRun(name="Search")]
+    chat_agent = ConversationalChatAgent.from_llm_and_tools(llm=llm, tools=tools)
+    executor = AgentExecutor.from_agent_and_tools(
+        agent=chat_agent,
+        tools=tools,
+        memory=memory,
+        return_intermediate_steps=True,
+        handle_parsing_errors=True,
     )
+    with st.chat_message("assistant"):
+        st_cb = StreamlitCallbackHandler(st.container(), expand_new_thoughts=False)
+        cfg = RunnableConfig()
+        cfg["callbacks"] = [st_cb]
+        response = executor.invoke(prompt, cfg)
+        st.write(response["output"])
+        st.session_state.steps[str(len(msgs.messages) - 1)] = response["intermediate_steps"]
 
-    for word in _LOREM_IPSUM.split(" "):
-        yield word + " "
-        time.sleep(0.5)
-
-
-with st.form("data_stream_form"):   
-    submitted = st.form_submit_button("Submit")
-
-if st.button("Stream data"):
-    st.write_stream(stream_data)
-
-with st.form("my_form"):
-    text = st.text_area(
-        "Enter text:",
-        "What are the three key pieces of advice for learning how to code?",
-    )
-    submitted = st.form_submit_button("Submit")
-    if not openai_api_key.startswith("sk-"):
-        st.warning("Please enter your OpenAI API key!", icon="⚠")
-    if submitted and openai_api_key.startswith("sk-"):
-        generate_response(text)
-
-with st.chat_message("user"):
-    st.write("Hello 👋")
-    st.line_chart(np.random.randn(30, 3))
-
-with st.form("data_form"):
-    st.write(1234)
-    st.write(
-        pd.DataFrame(
-            {
-            "first column": [1, 2, 3, 4],
-            "second column": [10, 20, 30, 40],
-             }
-        )
-    )
+with st.sidebar:
+    st.markdown("# Prime health monitor") 
+    if st.button("Refresh"):
+        msgs.clear()
+        st.session_state.steps = {}
+        # frg_cgm_auto_update()
+    if st.session_state.cgm_user_msg1:
+        frg_emergency()
+    frg_option()
+    frg_meal()
+    if st.button("Monitor and Ask Agent"):
+        frg_cgm_auto_update()
+        st.session_state.cgm_user_msg1 = None
