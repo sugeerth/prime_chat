@@ -89,7 +89,7 @@ def update_selection():
         input_variables=["activity"],
         template="Do you want to check this {activity} activity impact your current glucose level?"
     )
-    st.write(f"selected the selected_option_activity: {st.session_state.selected_option_activity}")
+    st.write(f"Ask more to agent on : {st.session_state.selected_option_activity}")
     # st.write(f"selected the key_activity: {st.session_state.key_activity}")
      # ---- activity prompt ----/
     formatted_activity_prompt = prompt_template.format(activity=st.session_state.selected_option_activity)
@@ -469,8 +469,13 @@ with st.sidebar:
         # frg_cgm_auto_update()
     if st.session_state.cgm_user_msg1:
         frg_emergency()
+        
     frg_option()
+    if st.button("Ask Agent ->"):
+        pass
     frg_meal()
+    if st.button("Check plan ->"):
+        pass
     if st.button("Monitor and Ask Agent"):
         frg_cgm_auto_update()
         st.session_state.cgm_user_msg1 = None
